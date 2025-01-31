@@ -2,6 +2,7 @@ require('dotenv').config();
 const { Telegraf, Markup } = require('telegraf');
 const axios = require('axios');
 const sqlite3 = require('sqlite3').verbose();
+const cron = require('node-cron');
 
 // Инициализация базы данных
 const db = new sqlite3.Database('./bot.db', (err) => {
@@ -18,7 +19,9 @@ db.serialize(() => {
     CREATE TABLE IF NOT EXISTS users (
       id INTEGER PRIMARY KEY,
       source TEXT DEFAULT 'danbooru',
-      is_subscriber INTEGER DEFAULT 0
+      is_subscriber INTEGER DEFAULT 0,
+      auto_send_time TEXT DEFAULT NULL,
+      auto_send_tags TEXT DEFAULT NULL
     )
   `);
 });
@@ -49,7 +52,7 @@ const SOURCES = {
     }),
     parser: (data) => data.posts,
     caption: (post) => `Artist: ${post.tags.artist?.join(', ') || 'Unknown'}`,
-    restricted: true, // for paid subsriber//you can turn false
+    restricted: true, // for paid subscribers
     headers: {
       'User-Agent': 'YourBot/1.0 (by YourUsername)' // Укажите свои данные
     }
@@ -89,19 +92,19 @@ const SOURCES = {
 // Получение настроек пользователя
 async function getUserSettings(userId) {
   return new Promise((resolve, reject) => {
-    db.get('SELECT source, is_subscriber FROM users WHERE id = ?', [userId], (err, row) => {
+    db.get('SELECT source, is_subscriber, auto_send_time, auto_send_tags FROM users WHERE id = ?', [userId], (err, row) => {
       if (err) reject(err);
-      resolve(row || { source: 'danbooru', is_subscriber: 0 });
+      resolve(row || { source: 'danbooru', is_subscriber: 0, auto_send_time: null, auto_send_tags: null });
     });
   });
 }
 
 // Обновление настроек пользователя
-async function updateUserSettings(userId, source) {
+async function updateUserSettings(userId, settings) {
   return new Promise((resolve, reject) => {
     db.run(
-      'INSERT OR REPLACE INTO users (id, source) VALUES (?, ?)',
-      [userId, source],
+      'INSERT OR REPLACE INTO users (id, source, is_subscriber, auto_send_time, auto_send_tags) VALUES (?, ?, ?, ?, ?)',
+      [userId, settings.source, settings.is_subscriber, settings.auto_send_time, settings.auto_send_tags],
       (err) => (err ? reject(err) : resolve())
     );
   });
@@ -134,8 +137,35 @@ async function fetchPosts(source, tags, page = 1) {
   }
 }
 
-// Команда /settings
-bot.command('settings', async (ctx) => {
+// Команда /start
+bot.start(async (ctx) => {
+  const userId = ctx.from.id;
+
+  // Сохраняем пользователя в базу данных, если его нет
+  db.run(
+    `INSERT OR IGNORE INTO users (id, source, is_subscriber, auto_send_time, auto_send_tags) VALUES (?, 'danbooru', 0, NULL, NULL)`,
+    [userId]
+  );
+
+  // Отправляем сообщение с кнопками
+  await ctx.reply(
+    `Привет, ${ctx.from.first_name || 'друг'}! 👋\n\n` +
+      `Я бот для поиска и автоматической отправки артов.\n\n` +
+      `📚 Возможности:\n` +
+      `- Поиск по тегам\n` +
+      `- Выбор источника\n` +
+      `- Автоматическая отправка артов в ЛС или группу\n\n` +
+      `Используй кнопки ниже, чтобы настроить бота:`,
+    Markup.inlineKeyboard([
+      [Markup.button.callback('⚙️ Настройки', 'open_settings')],
+      [Markup.button.callback('✨ Подписка', 'subscribe')],
+      [Markup.button.callback('⏰ Таймер', 'set_timer')]
+    ])
+  );
+});
+
+// Обработка нажатия кнопки "Настройки"
+bot.action('open_settings', async (ctx) => {
   const userId = ctx.from.id;
   const user = await getUserSettings(userId);
 
@@ -146,68 +176,111 @@ bot.command('settings', async (ctx) => {
     [Markup.button.callback('Rule34 (только для подписчиков)', 'set_source_rule34')]
   ]);
 
-  ctx.reply(`Текущий источник: ${SOURCES[user.source].name}\nВыберите новый источник:`, keyboard);
+  ctx.reply(
+    `⚙️ Текущий источник: ${SOURCES[user.source].name}\nВыберите новый источник:`,
+    keyboard
+  );
 });
 
-// Обработка выбора источника
-bot.action(/set_source_(.+)/, async (ctx) => {
+// Обработка нажатия кнопки "Подписка"
+bot.action('subscribe', async (ctx) => {
+  ctx.reply(
+    '✨ Премиум подписка дает доступ к эксклюзивным источникам, например Rule34.\n\n' +
+      `Чтобы оформить подписку, свяжитесь с администратором.`
+  );
+});
+
+// Обработка нажатия кнопки "Таймер"
+bot.action('set_timer', async (ctx) => {
+  const userId = ctx.from.id;
+  const user = await getUserSettings(userId);
+
+  ctx.reply(
+    `⏰ Введите время в формате ЧЧ:ММ (например, 21:00):`
+  );
+
+  // Ожидание ввода времени
+  bot.on('text', async (ctx) => {
+    const time = ctx.message.text.trim();
+    const [hours, minutes] = time.split(':');
+
+    // Проверка формата времени
+    if (!/^\d{2}:\d{2}$/.test(time) || isNaN(hours) || isNaN(minutes) || hours < 0 || hours > 23 || minutes < 0 || minutes > 59) {
+      return ctx.reply('❌ Неверный формат времени. Введите время в формате ЧЧ:ММ (например, 21:00).');
+    }
+
+    // Преобразуем время в CRON-формат
+    const cronTime = `${minutes} ${hours} * * *`;
+
+    // Сохраняем время в настройках пользователя
+    await updateUserSettings(userId, {
+      ...user,
+      auto_send_time: cronTime
+    });
+
+    // Запрашиваем источник
+    ctx.reply(
+      `✅ Время установлено: ${time}\n\n` +
+      `Выберите источник для автоматической отправки:`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback('Danbooru', 'set_timer_source_danbooru')],
+        [Markup.button.callback('e926', 'set_timer_source_e926')],
+        [Markup.button.callback('e621 (только для подписчиков)', 'set_timer_source_e621')],
+        [Markup.button.callback('Rule34 (только для подписчиков)', 'set_timer_source_rule34')]
+      ])
+    );
+  });
+});
+
+// Обработка выбора источника для таймера
+bot.action(/set_timer_source_(.+)/, async (ctx) => {
   const userId = ctx.from.id;
   const source = ctx.match[1];
+  const user = await getUserSettings(userId);
 
-  if (SOURCES[source].restricted && !(await checkAccess(userId, source))) {
+  if (SOURCES[source].restricted && !user.is_subscriber) {
     return ctx.reply('❌ Доступ к этому источнику ограничен. Оформите подписку.');
   }
 
-  await updateUserSettings(userId, source);
-  ctx.reply(`✅ Источник изменен на: ${SOURCES[source].name}`);
-});
+  // Сохраняем источник в настройках пользователя
+  await updateUserSettings(userId, {
+    ...user,
+    source: source
+  });
 
-// Инлайн-режим
-bot.on('inline_query', async (ctx) => {
-  const userId = ctx.from.id;
-  const query = ctx.inlineQuery.query.trim();
-  const offset = parseInt(ctx.inlineQuery.offset) || 1;
-  const currentPage = offset === 0 ? 1 : offset;
+  // Запрашиваем теги
+  ctx.reply(
+    `✅ Источник установлен: ${SOURCES[source].name}\n\n` +
+    `Введите теги для автоматической отправки (через пробел):`
+  );
 
-  if (!query) return;
+  // Ожидание ввода тегов
+  bot.on('text', async (ctx) => {
+    const tags = ctx.message.text.trim();
 
-  const user = await getUserSettings(userId);
-  const source = user.source;
+    // Сохраняем теги в настройках пользователя
+    await updateUserSettings(userId, {
+      ...user,
+      auto_send_tags: tags
+    });
 
-  if (!(await checkAccess(userId, source))) {
-    return ctx.answerInlineQuery([{
-      type: 'article',
-      id: 'no_access',
-      title: '❌ Доступ ограничен',
-      input_message_content: {
-        message_text: 'У вас нет доступа к этому источнику. Оформите подписку.'
+    // Запуск таймера
+    cron.schedule(user.auto_send_time, async () => {
+      const data = await fetchPosts(source, tags);
+      if (data && data.results.length) {
+        const post = data.results[0];
+        ctx.telegram.sendPhoto(userId, post.file_url || post.file.url, {
+          caption: SOURCES[source].caption(post)
+        });
       }
-    }]);
-  }
+    });
 
-  const data = await fetchPosts(source, query, currentPage);
-  if (!data || !data.results.length) {
-    return ctx.answerInlineQuery([{
-      type: 'article',
-      id: 'no_results',
-      title: 'Ничего не найдено',
-      input_message_content: {
-        message_text: 'По вашему запросу ничего не найдено 😢\nПопробуйте другие теги'
-      }
-    }]);
-  }
-
-  const inlineResults = data.results.map((post, index) => ({
-    type: 'photo',
-    id: `${source}_${post.id}_${Date.now()}_${index}`,
-    photo_url: post.file_url || post.file.url,
-    thumb_url: post.preview_url || post.preview?.url || post.file_url,
-    caption: SOURCES[source].caption(post)
-  }));
-
-  ctx.answerInlineQuery(inlineResults, {
-    next_offset: data.nextPage,
-    cache_time: 30
+    ctx.reply(
+      `✅ Таймер настроен!\n` +
+      `- Время: ${user.auto_send_time}\n` +
+      `- Источник: ${SOURCES[source].name}\n` +
+      `- Теги: ${tags}`
+    );
   });
 });
 
